@@ -71,6 +71,22 @@ function hasAlloy() {
 }
 
 function sendXdmEvent(xdm) {
+  const crmMap = crmIdentityMap();
+  if (crmMap) {
+    // Signed in: attach the authenticated CRM ID to every event, not just
+    // purchases — that's what makes it a realistic authenticated identity
+    // rather than a one-off. It's the strongest identity signal we have, so
+    // demote any other identity (e.g. the guest-checkout Email) on this
+    // event to non-primary rather than leaving two identities flagged primary.
+    xdm.identityMap = Object.assign({}, xdm.identityMap, crmMap);
+    Object.keys(xdm.identityMap).forEach(function (namespace) {
+      if (namespace === "crmId") return;
+      xdm.identityMap[namespace] = xdm.identityMap[namespace].map(function (entry) {
+        return Object.assign({}, entry, { primary: false });
+      });
+    });
+  }
+
   if (hasAlloy()) {
     window.alloy("sendEvent", { xdm: xdm }).catch(function (err) {
       console.warn("[tracking] alloy sendEvent failed:", err);
@@ -107,6 +123,122 @@ function emailIdentityMap(email) {
       Email: [{ id: hashedEmail, authenticatedState: "ambiguous", primary: true }]
     };
   });
+}
+
+/* ---------- Mock authentication (CRM ID) ----------
+   No real backend, no password — just enough to demonstrate a genuinely
+   authenticated identity (as opposed to the guest-checkout email, which is
+   only ever "ambiguous"). The CRM ID is derived deterministically from
+   whatever's typed in, so re-"signing in" with the same value always
+   resolves to the same ID — useful for repeat-visit identity testing. The
+   raw typed value is never sent to AEP, only the derived ID. Requires the
+   `crmId` identity namespace to exist in AEP (Identities → Namespaces). */
+
+const CRM_KEY = "deepgroove_crm";
+
+function getCrmSession() {
+  try {
+    return JSON.parse(localStorage.getItem(CRM_KEY)) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function crmIdFor(identifier) {
+  return sha256Hex(identifier.trim().toLowerCase()).then(function (hash) {
+    return "CRM-" + hash.slice(0, 12).toUpperCase();
+  });
+}
+
+function signIn(identifier) {
+  return crmIdFor(identifier).then(function (crmId) {
+    localStorage.setItem(CRM_KEY, JSON.stringify({ identifier: identifier.trim(), crmId: crmId }));
+    updateAuthUI();
+    trackPageView(); // fires immediately with the new identity attached
+    return crmId;
+  });
+}
+
+function signOut() {
+  localStorage.removeItem(CRM_KEY);
+  updateAuthUI();
+}
+
+// Returns an identityMap fragment for the signed-in CRM ID, or null if
+// signed out. authenticatedState is "authenticated" — unlike the guest
+// checkout email, this represents a real (mock) sign-in.
+function crmIdentityMap() {
+  const session = getCrmSession();
+  if (!session) {
+    return null;
+  }
+  return {
+    crmId: [{ id: session.crmId, authenticatedState: "authenticated", primary: true }]
+  };
+}
+
+function updateAuthUI() {
+  const btn = document.querySelector("[data-auth-trigger]");
+  if (!btn) {
+    return;
+  }
+  const session = getCrmSession();
+  if (session) {
+    btn.textContent = "Hi, " + session.identifier + " · Sign Out";
+    btn.onclick = signOut;
+  } else {
+    btn.textContent = "Sign In";
+    btn.onclick = openAuthModal;
+  }
+}
+
+function openAuthModal() {
+  if (document.querySelector(".auth-overlay")) {
+    return;
+  }
+  const overlay = document.createElement("div");
+  overlay.className = "auth-overlay";
+  overlay.innerHTML = `
+    <div class="auth-modal">
+      <h2>Sign in</h2>
+      <p>Mock sign-in — no password, no backend. Illustrates an authenticated
+      identity (CRM ID) attaching to every event, unlike the ambiguous guest
+      email at checkout.</p>
+      <form id="auth-form">
+        <div class="field">
+          <label for="auth-identifier">Email or username</label>
+          <input class="input" id="auth-identifier" placeholder="you@example.com" required />
+        </div>
+        <div class="actions">
+          <button type="button" class="btn btn-secondary" data-auth-cancel>Cancel</button>
+          <button type="submit" class="btn btn-primary">Sign in</button>
+        </div>
+      </form>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  overlay.addEventListener("click", function (e) {
+    if (e.target === overlay) {
+      closeAuthModal();
+    }
+  });
+  overlay.querySelector("[data-auth-cancel]").addEventListener("click", closeAuthModal);
+  overlay.querySelector("#auth-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    const identifier = document.getElementById("auth-identifier").value;
+    if (!identifier.trim()) {
+      return;
+    }
+    signIn(identifier).then(closeAuthModal);
+  });
+}
+
+function closeAuthModal() {
+  const overlay = document.querySelector(".auth-overlay");
+  if (overlay) {
+    overlay.remove();
+  }
 }
 
 function trackPageView() {
@@ -172,4 +304,7 @@ function trackPurchase(order, cart, email) {
   }
 }
 
-document.addEventListener("DOMContentLoaded", updateCartBadge);
+document.addEventListener("DOMContentLoaded", function () {
+  updateCartBadge();
+  updateAuthUI();
+});
